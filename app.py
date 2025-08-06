@@ -94,10 +94,6 @@ else:
         st.markdown(f"**User:** {st.session_state.username}")
         st.markdown("---")
         
-        # Navigation help
-        st.markdown("### 📍 Navigation")
-        st.info("Use the pages below to navigate through different modules")
-        
         # Logout button at bottom
         st.markdown("---")
         if st.button("🚪 Logout", use_container_width=True):
@@ -106,35 +102,6 @@ else:
     
     # Main content area
     st.markdown("## Welcome to Manufacturing Module")
-    
-    # Quick stats
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(
-            label="🏭 Active Production Orders",
-            value="12",
-            delta="3 new today"
-        )
-    with col2:
-        st.metric(
-            label="📦 Pending Material Issues",
-            value="5",
-            delta="-2 vs yesterday"
-        )
-    with col3:
-        st.metric(
-            label="✅ Completed Today",
-            value="8",
-            delta="60% completion rate"
-        )
-    with col4:
-        st.metric(
-            label="⚠️ Low Stock Items",
-            value="3",
-            delta="Requires attention"
-        )
-    
-    st.markdown("---")
     
     # Quick actions
     st.markdown("### 🚀 Quick Actions")
@@ -164,32 +131,7 @@ else:
             st.switch_page("pages/3_📊_Reports.py")
         st.markdown('</div>', unsafe_allow_html=True)
     
-    # Recent activities
-    st.markdown("---")
-    st.markdown("### 📜 Recent Activities")
-    
-    # Sample recent activities
-    activities = [
-        {"time": "10 mins ago", "action": "Production Order PO-20250106-001 created", "user": "John Doe", "type": "info"},
-        {"time": "25 mins ago", "action": "Material issued for Kitting order KIT-20250106-003", "user": "Jane Smith", "type": "success"},
-        {"time": "1 hour ago", "action": "BOM updated for Product ABC-123", "user": "Admin", "type": "warning"},
-        {"time": "2 hours ago", "action": "5 units received from production order PO-20250106-002", "user": "Mike Wilson", "type": "success"},
-    ]
-    
-    for activity in activities:
-        col1, col2, col3 = st.columns([1, 6, 2])
-        with col1:
-            st.markdown(f"🕒 {activity['time']}")
-        with col2:
-            if activity['type'] == 'success':
-                st.success(activity['action'])
-            elif activity['type'] == 'warning':
-                st.warning(activity['action'])
-            else:
-                st.info(activity['action'])
-        with col3:
-            st.markdown(f"👤 {activity['user']}")
-    
+
     # Footer
     st.markdown("---")
     st.markdown(

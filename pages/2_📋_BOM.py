@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 from utils.auth import AuthManager
 from modules.bom import BOMManager
 from modules.common import (
-    get_products, format_number, create_status_badge,
+    get_products, format_number, create_status_badge, create_status_indicator,
     confirm_action, show_success_message, show_error_message,
     create_download_button
 )
@@ -106,8 +106,10 @@ if st.session_state.bom_view == 'list':
         
         # Display BOMs
         for idx, bom in boms.iterrows():
-            status_html = create_status_badge(bom['status'])
-            with st.expander(f"{bom['bom_code']} - {bom['bom_name']} | {status_html}", expanded=False):
+            # Create expander with status indicator
+            expander_title = f"{bom['bom_code']} - {bom['bom_name']} | {create_status_indicator(bom['status'])}"
+            with st.expander(expander_title, expanded=False):
+                # Main info columns
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.write(f"**Type:** {bom['bom_type']}")
@@ -336,7 +338,8 @@ elif st.session_state.bom_view == 'edit':
             col1, col2 = st.columns([3, 1])
             with col1:
                 bom_options = dict(zip(
-                    boms['bom_code'] + " - " + boms['bom_name'] + " (" + boms['status'] + ")", 
+                    boms['bom_code'] + " - " + boms['bom_name'] + " | " + 
+                    boms['status'].apply(create_status_indicator), 
                     boms['id']
                 ))
                 selected = st.selectbox("Select BOM to View/Edit", options=list(bom_options.keys()))
@@ -366,8 +369,7 @@ elif st.session_state.bom_view == 'edit':
             with col1:
                 st.metric("BOM Code", bom_info['bom_code'])
             with col2:
-                st.metric("Status", bom_info['status'])
-                st.markdown(create_status_badge(bom_info['status']), unsafe_allow_html=True)
+                st.metric("Status", create_status_indicator(bom_info['status']))
             with col3:
                 st.metric("Version", bom_info['version'])
             with col4:

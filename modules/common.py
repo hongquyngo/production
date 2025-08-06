@@ -156,6 +156,29 @@ def create_status_badge(status: str) -> str:
     return f'<span style="background-color: {color}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">{status}</span>'
 
 
+def create_status_indicator(status: str) -> str:
+    """Create text-based status indicator with emoji (alternative to HTML badge)"""
+    status_emoji = {
+        'DRAFT': '📝',
+        'CONFIRMED': '✅',
+        'IN_PROGRESS': '🔄',
+        'COMPLETED': '✔️',
+        'CANCELLED': '❌',
+        'ACTIVE': '🟢',
+        'INACTIVE': '⭕',
+        'EXPIRED': '🔴',
+        'CRITICAL': '🚨',
+        'WARNING': '⚠️',
+        'OK': '✅',
+        'PASSED': '✅',
+        'FAILED': '❌',
+        'PENDING': '⏳'
+    }
+    
+    emoji = status_emoji.get(status.upper(), '⚪')
+    return f"{emoji} {status}"
+
+
 @st.cache_data(ttl=60)  # Cache for 1 minute
 def get_product_info(product_id: int) -> Optional[Dict[str, Any]]:
     """Get detailed product information"""
