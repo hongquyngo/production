@@ -115,21 +115,30 @@ class ProductionManager:
         return pd.read_sql(query, self.engine, params=(order_id,))
     
     def calculate_material_requirements(self, bom_id, quantity):
-        """Calculate materials needed for production"""
+        """
+        Calculate materials needed for production
+        Formula: (MO Planned Qty ÷ BOM Output Qty) × BOM Detail Qty × (1 + Scrap Rate)
+        """
         query = """
         SELECT 
             d.material_id,
             p.name as material_name,
-            d.quantity * %s * (1 + d.scrap_rate/100) as required_qty,
+            (%s / h.output_qty) as production_cycles,
+            d.quantity as base_qty,
+            d.scrap_rate,
+            CEILING((%s / h.output_qty) * d.quantity * (1 + d.scrap_rate/100)) as required_qty,
             d.uom,
             d.material_type
         FROM bom_details d
         JOIN products p ON d.material_id = p.id
+        JOIN bom_headers h ON d.bom_header_id = h.id
         WHERE d.bom_header_id = %s
+        AND h.output_qty > 0  -- Avoid division by zero
         """
         
-        return pd.read_sql(query, self.engine, params=(quantity, bom_id))
-    
+        return pd.read_sql(query, self.engine, params=(quantity, quantity, bom_id))
+
+
     def create_order(self, order_data):
         """Create new production order"""
         conn = self.engine.connect()
@@ -187,7 +196,7 @@ class ProductionManager:
             SELECT 
                 :order_id,
                 d.material_id,
-                d.quantity * :planned_qty * (1 + d.scrap_rate/100),
+                CEILING((:planned_qty / h.output_qty) * d.quantity * (1 + d.scrap_rate/100)),
                 d.uom,
                 :warehouse_id
             FROM bom_details d

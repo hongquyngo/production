@@ -44,7 +44,6 @@ auth = AuthManager()
 if not auth.check_session():
     # Login Page
     st.markdown('<p class="main-header">🏭 Manufacturing Module</p>', unsafe_allow_html=True)
-    st.markdown("### Please login to continue")
     
     # Center the login form
     col1, col2, col3 = st.columns([1, 2, 1])
