@@ -30,7 +30,6 @@ def get_products() -> pd.DataFrame:
         b.brand_name as brand,
         p.approval_status,
         p.is_service,
-        p.is_raw_material,
         COALESCE(
             (SELECT SUM(ih.remain) 
              FROM inventory_histories ih 
@@ -317,7 +316,6 @@ def get_product_info(product_id: int) -> Optional[Dict[str, Any]]:
         p.shelf_life_uom,
         p.storage_condition,
         b.brand_name as brand,
-        p.is_raw_material,
         p.min_stock_level,
         p.max_stock_level,
         COALESCE(

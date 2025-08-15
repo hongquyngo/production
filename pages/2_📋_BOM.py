@@ -1,9 +1,9 @@
-# pages/2_📋_BOM.py - Bill of Materials Management
+# pages/2_📋_BOM.py - Bill of Materials Management (Enhanced)
 import streamlit as st
 import pandas as pd
 from datetime import date
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from utils.auth import AuthManager
 from modules.bom import BOMManager
 from modules.common import (
@@ -13,7 +13,8 @@ from modules.common import (
     show_success_message, 
     show_error_message,
     confirm_action, 
-    create_download_button
+    create_download_button,
+    get_warehouses
 )
 import logging
 
@@ -43,32 +44,34 @@ if 'selected_bom' not in st.session_state:
     st.session_state.selected_bom = None
 if 'temp_materials' not in st.session_state:
     st.session_state.temp_materials = []
-
-# Top navigation
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    if st.button("📋 BOM List", use_container_width=True, 
-                type="primary" if st.session_state.bom_view == 'list' else "secondary"):
-        st.session_state.bom_view = 'list'
-        st.session_state.selected_bom = None
-with col2:
-    if st.button("➕ Create BOM", use_container_width=True, 
-                type="primary" if st.session_state.bom_view == 'create' else "secondary"):
-        st.session_state.bom_view = 'create'
-        st.session_state.temp_materials = []
-with col3:
-    if st.button("✏️ View/Edit BOM", use_container_width=True, 
-                type="primary" if st.session_state.bom_view == 'edit' else "secondary"):
-        st.session_state.bom_view = 'edit'
-with col4:
-    if st.button("📊 BOM Analysis", use_container_width=True, 
-                type="primary" if st.session_state.bom_view == 'analysis' else "secondary"):
-        st.session_state.bom_view = 'analysis'
-
-st.markdown("---")
+if 'product_info_cache' not in st.session_state:
+    st.session_state.product_info_cache = {}
 
 # Helper functions
-def format_bom_type(bom_type):
+def get_product_options_with_info() -> Tuple[Dict[str, int], Dict[int, Dict], pd.DataFrame]:
+    """Get products with full information for dropdowns and auto-fill"""
+    products = get_products()
+    product_options = {}
+    product_info = {}
+    
+    if not products.empty:
+        for _, prod in products.iterrows():
+            display_name = f"{prod['name']} ({prod['code']})"
+            product_options[display_name] = prod['id']
+            product_info[prod['id']] = {
+                'name': prod['name'],
+                'code': prod['code'],
+                'uom': prod['uom'],
+                'package_size': prod.get('package_size', ''),
+                'total_stock': prod.get('total_stock', 0)
+            }
+    
+    # Cache product info for later use
+    st.session_state.product_info_cache = product_info
+    
+    return product_options, product_info, products
+
+def format_bom_type(bom_type: str) -> str:
     """Format BOM type with icon"""
     type_icons = {
         'KITTING': '📦',
@@ -77,7 +80,7 @@ def format_bom_type(bom_type):
     }
     return f"{type_icons.get(bom_type, '📄')} {bom_type}"
 
-def validate_material_addition(material_id, quantity, scrap_rate):
+def validate_material_addition(material_id: int, quantity: float, scrap_rate: float) -> Tuple[bool, Optional[str]]:
     """Validate material before adding to BOM"""
     if not material_id:
         return False, "Please select a material"
@@ -86,6 +89,39 @@ def validate_material_addition(material_id, quantity, scrap_rate):
     if scrap_rate < 0 or scrap_rate > 100:
         return False, "Scrap rate must be between 0 and 100"
     return True, None
+
+def cleanup_session_state():
+    """Clean up temporary session state variables"""
+    keys_to_clean = [k for k in st.session_state.keys() if k.startswith('confirm_delete_')]
+    for key in keys_to_clean:
+        del st.session_state[key]
+
+# Top navigation
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    if st.button("📋 BOM List", use_container_width=True, 
+                type="primary" if st.session_state.bom_view == 'list' else "secondary"):
+        st.session_state.bom_view = 'list'
+        st.session_state.selected_bom = None
+        cleanup_session_state()
+        
+with col2:
+    if st.button("➕ Create BOM", use_container_width=True, 
+                type="primary" if st.session_state.bom_view == 'create' else "secondary"):
+        st.session_state.bom_view = 'create'
+        st.session_state.temp_materials = []
+        
+with col3:
+    if st.button("✏️ View/Edit BOM", use_container_width=True, 
+                type="primary" if st.session_state.bom_view == 'edit' else "secondary"):
+        st.session_state.bom_view = 'edit'
+        
+with col4:
+    if st.button("📊 BOM Analysis", use_container_width=True, 
+                type="primary" if st.session_state.bom_view == 'analysis' else "secondary"):
+        st.session_state.bom_view = 'analysis'
+
+st.markdown("---")
 
 # Content based on view
 if st.session_state.bom_view == 'list':
@@ -131,7 +167,10 @@ if st.session_state.bom_view == 'list':
         
         # Display BOMs
         for idx, bom in boms.iterrows():
-            with st.expander(f"{bom['bom_code']} - {bom['bom_name']} | {create_status_indicator(bom['status'])}", expanded=False):
+            with st.expander(
+                f"{bom['bom_code']} - {bom['bom_name']} | {create_status_indicator(bom['status'])}", 
+                expanded=False
+            ):
                 # BOM header info
                 col1, col2, col3 = st.columns(3)
                 
@@ -160,9 +199,13 @@ if st.session_state.bom_view == 'list':
                         st.rerun()
                 
                 with col2:
-                    if bom['status'] == 'ACTIVE' and st.button("📋 Copy BOM", key=f"copy_{bom['id']}", use_container_width=True):
+                    if bom['status'] == 'ACTIVE' and st.button(
+                        "📋 Copy BOM", key=f"copy_{bom['id']}", use_container_width=True
+                    ):
                         try:
-                            new_code = bom_manager.create_new_version(bom['id'], st.session_state.user_id)
+                            new_code = bom_manager.create_new_version(
+                                bom['id'], st.session_state.user_id
+                            )
                             show_success_message(f"Created new BOM version: {new_code}")
                             time.sleep(2)
                             st.rerun()
@@ -170,7 +213,9 @@ if st.session_state.bom_view == 'list':
                             show_error_message("Error creating new version", str(e))
                 
                 with col3:
-                    if bom['usage_count'] == 0 and st.button("🗑️ Delete", key=f"delete_{bom['id']}", use_container_width=True):
+                    if bom['usage_count'] == 0 and st.button(
+                        "🗑️ Delete", key=f"delete_{bom['id']}", use_container_width=True
+                    ):
                         if st.session_state.get(f'confirm_delete_{bom["id"]}'):
                             try:
                                 bom_manager.delete_bom(bom['id'], st.session_state.user_id)
@@ -201,6 +246,9 @@ elif st.session_state.bom_view == 'create':
     # Create New BOM
     st.subheader("➕ Create New BOM")
     
+    # Get product options with info
+    product_options, product_info, products = get_product_options_with_info()
+    
     # Basic Information
     st.markdown("### Basic Information")
     col1, col2 = st.columns(2)
@@ -209,22 +257,32 @@ elif st.session_state.bom_view == 'create':
         bom_name = st.text_input("BOM Name*", placeholder="e.g., Standard Kit A")
         bom_type = st.selectbox("BOM Type*", ["KITTING", "CUTTING", "REPACKING"])
         
-        # Get products
-        products = get_products()
-        if not products.empty:
-            product_options = dict(zip(
-                products['name'] + " (" + products['code'] + ")", 
-                products['id']
-            ))
-            selected_product = st.selectbox("Output Product*", options=list(product_options.keys()))
+        if product_options:
+            selected_product = st.selectbox(
+                "Output Product*", 
+                options=list(product_options.keys()),
+                key='output_product_select'
+            )
             product_id = product_options[selected_product] if selected_product else None
         else:
             st.error("No products found. Please add products first.")
             product_id = None
+            selected_product = None
     
     with col2:
         output_qty = st.number_input("Output Quantity*", min_value=0.01, value=1.0, step=0.01)
-        uom = st.text_input("UOM*", value="PCS")
+        
+        # Auto-fill UOM from selected product
+        if product_id and product_id in product_info:
+            uom = st.text_input(
+                "UOM*", 
+                value=product_info[product_id]['uom'], 
+                disabled=True,
+                help="Unit of Measure is automatically set from the selected product"
+            )
+        else:
+            uom = st.text_input("UOM*", value="PCS")
+        
         effective_date = st.date_input("Effective Date*", value=date.today())
     
     # Notes
@@ -238,38 +296,69 @@ elif st.session_state.bom_view == 'create':
         col1, col2, col3, col4, col5, col6 = st.columns([3, 1.5, 1, 1.5, 1, 1])
         
         with col1:
+            material_options = [""] + list(product_options.keys()) if product_options else [""]
             material_select = st.selectbox(
                 "Select Material",
-                options=[""] + list(product_options.keys()) if products is not None else [""],
+                options=material_options,
                 key="new_material_select"
             )
         
         with col2:
-            material_qty = st.number_input("Quantity", min_value=0.0001, value=1.0, step=0.0001, key="new_material_qty")
+            material_qty = st.number_input(
+                "Quantity", 
+                min_value=0.0001, 
+                value=1.0, 
+                step=0.0001, 
+                key="new_material_qty"
+            )
         
         with col3:
-            material_uom = st.text_input("UOM", value="PCS", key="new_material_uom")
+            # Auto-fill UOM for selected material
+            if material_select and material_select != "" and material_select in product_options:
+                selected_material_id = product_options[material_select]
+                material_uom = st.text_input(
+                    "UOM", 
+                    value=product_info.get(selected_material_id, {}).get('uom', 'PCS'),
+                    disabled=True,
+                    key="new_material_uom"
+                )
+            else:
+                material_uom = st.text_input("UOM", value="PCS", key="new_material_uom")
         
         with col4:
-            material_type = st.selectbox("Type", ["RAW_MATERIAL", "PACKAGING", "CONSUMABLE"], key="new_material_type")
+            material_type = st.selectbox(
+                "Type", 
+                ["RAW_MATERIAL", "PACKAGING", "CONSUMABLE"], 
+                key="new_material_type"
+            )
         
         with col5:
-            scrap_rate = st.number_input("Scrap %", min_value=0.0, max_value=50.0, value=0.0, step=0.1, key="new_scrap_rate")
+            scrap_rate = st.number_input(
+                "Scrap %", 
+                min_value=0.0, 
+                max_value=50.0, 
+                value=0.0, 
+                step=0.1, 
+                key="new_scrap_rate"
+            )
         
         with col6:
             if st.button("➕ Add", use_container_width=True, type="primary"):
                 if material_select and material_select != "":
                     # Validate
+                    material_id = product_options[material_select]
                     is_valid, error_msg = validate_material_addition(
-                        material_select, material_qty, scrap_rate
+                        material_id, material_qty, scrap_rate
                     )
                     
                     if not is_valid:
                         st.error(error_msg)
                     else:
-                        material_id = product_options[material_select]
                         # Check if already exists
-                        existing = [m for m in st.session_state.temp_materials if m['material_id'] == material_id]
+                        existing = [
+                            m for m in st.session_state.temp_materials 
+                            if m['material_id'] == material_id
+                        ]
                         if existing:
                             st.warning("Material already added")
                         else:
@@ -426,12 +515,17 @@ elif st.session_state.bom_view == 'edit':
             st.markdown("### Materials")
             if not bom_details.empty:
                 # Calculate totals
-                bom_details['total_qty_with_scrap'] = bom_details['quantity'] * (1 + bom_details['scrap_rate']/100)
+                bom_details['total_qty_with_scrap'] = (
+                    bom_details['quantity'] * (1 + bom_details['scrap_rate']/100)
+                )
                 
                 # Display materials
                 st.dataframe(
-                    bom_details[['material_name', 'material_code', 'material_type', 
-                               'quantity', 'uom', 'scrap_rate', 'total_qty_with_scrap', 'current_stock']],
+                    bom_details[[
+                        'material_name', 'material_code', 'material_type', 
+                        'quantity', 'uom', 'scrap_rate', 'total_qty_with_scrap', 
+                        'current_stock'
+                    ]],
                     use_container_width=True,
                     hide_index=True,
                     column_config={
@@ -534,7 +628,7 @@ elif st.session_state.bom_view == 'analysis':
     # Analysis type selection
     analysis_type = st.selectbox(
         "Select Analysis Type",
-        ["Material Usage Summary", "Where Used Analysis", "BOM Comparison"]
+        ["Material Usage Summary", "Where Used Analysis", "BOM Comparison", "Cost Analysis"]
     )
     
     if analysis_type == "Material Usage Summary":
@@ -595,14 +689,10 @@ elif st.session_state.bom_view == 'analysis':
         st.markdown("### Where Used Analysis")
         st.write("Find all BOMs where a specific product/material is used")
         
-        # Product selection
-        products = get_products()
-        if not products.empty:
-            product_options = dict(zip(
-                products['name'] + " (" + products['code'] + ")", 
-                products['id']
-            ))
-            
+        # Get product options
+        product_options, _, _ = get_product_options_with_info()
+        
+        if product_options:
             col1, col2 = st.columns([3, 1])
             with col1:
                 selected_product = st.selectbox(
@@ -629,8 +719,10 @@ elif st.session_state.bom_view == 'analysis':
                     if not active_boms.empty:
                         st.markdown("**Active BOMs:**")
                         st.dataframe(
-                            active_boms[['bom_code', 'bom_name', 'output_product_name', 
-                                       'quantity', 'uom', 'material_type', 'total_requirement']],
+                            active_boms[[
+                                'bom_code', 'bom_name', 'output_product_name', 
+                                'quantity', 'uom', 'material_type', 'total_requirement'
+                            ]],
                             use_container_width=True,
                             hide_index=True,
                             column_config={
@@ -647,8 +739,10 @@ elif st.session_state.bom_view == 'analysis':
                     if not inactive_boms.empty:
                         with st.expander("Other BOMs (Draft/Inactive)"):
                             st.dataframe(
-                                inactive_boms[['bom_code', 'bom_name', 'bom_status', 
-                                             'quantity', 'uom']],
+                                inactive_boms[[
+                                    'bom_code', 'bom_name', 'bom_status', 
+                                    'quantity', 'uom'
+                                ]],
                                 use_container_width=True,
                                 hide_index=True
                             )
@@ -705,7 +799,10 @@ elif st.session_state.bom_view == 'analysis':
                 )
                 
                 # Calculate differences
-                comparison['qty_diff'] = comparison['quantity_bom2'].fillna(0) - comparison['quantity_bom1'].fillna(0)
+                comparison['qty_diff'] = (
+                    comparison['quantity_bom2'].fillna(0) - 
+                    comparison['quantity_bom1'].fillna(0)
+                )
                 comparison['status'] = comparison.apply(
                     lambda row: 'Only in BOM1' if pd.isna(row['quantity_bom2']) 
                     else 'Only in BOM2' if pd.isna(row['quantity_bom1'])
@@ -725,7 +822,9 @@ elif st.session_state.bom_view == 'analysis':
                     diff_count = len(comparison[comparison['status'] == 'Different'])
                     st.metric("Different Quantities", diff_count)
                 with col3:
-                    unique_count = len(comparison[comparison['status'].isin(['Only in BOM1', 'Only in BOM2'])])
+                    unique_count = len(
+                        comparison[comparison['status'].isin(['Only in BOM1', 'Only in BOM2'])]
+                    )
                     st.metric("Unique Materials", unique_count)
                 
                 # Detailed comparison
@@ -735,15 +834,34 @@ elif st.session_state.bom_view == 'analysis':
                     hide_index=True,
                     column_config={
                         "material_name": "Material",
-                        "quantity_bom1": st.column_config.NumberColumn(f"Qty ({selected_bom1.split(' - ')[0]})", format="%.4f"),
-                        "quantity_bom2": st.column_config.NumberColumn(f"Qty ({selected_bom2.split(' - ')[0]})", format="%.4f"),
+                        "quantity_bom1": st.column_config.NumberColumn(
+                            f"Qty ({selected_bom1.split(' - ')[0]})", 
+                            format="%.4f"
+                        ),
+                        "quantity_bom2": st.column_config.NumberColumn(
+                            f"Qty ({selected_bom2.split(' - ')[0]})", 
+                            format="%.4f"
+                        ),
                         "qty_diff": st.column_config.NumberColumn("Difference", format="%.4f"),
                         "status": "Status"
                     }
                 )
         else:
             st.info("Need at least 2 active BOMs for comparison")
+    
+    elif analysis_type == "Cost Analysis":
+        st.markdown("### Cost Analysis")
+        st.info("Cost analysis feature will be available once pricing data is integrated")
+        
+        # Placeholder for future cost analysis
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Material Cost", "N/A", help="Requires pricing data")
+        with col2:
+            st.metric("Labor Cost", "N/A", help="Requires labor rates")
+        with col3:
+            st.metric("Total Cost", "N/A", help="Sum of all costs")
 
 # Footer
 st.markdown("---")
-st.caption("BOM Management System v1.0")
+st.caption("BOM Management System v2.0 - Enhanced Edition")

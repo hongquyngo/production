@@ -23,7 +23,27 @@ class ProductionManager:
             'allow_partial_completion': True,
             'default_priority': 'NORMAL'
         }
-    
+        self._keycloak_cache = {}  # Cache keycloak_id
+
+    def get_keycloak_id_cached(self, user_id):
+        """Get keycloak_id with caching"""
+        if user_id not in self._keycloak_cache:
+            self._keycloak_cache[user_id] = self.get_keycloak_id(user_id)
+        return self._keycloak_cache[user_id]
+
+    def get_keycloak_id(self, user_id):
+        """Get keycloak_id from user_id"""
+        query = text("""
+            SELECT e.keycloak_id 
+            FROM users u
+            JOIN employees e ON u.employee_id = e.id
+            WHERE u.id = :user_id
+        """)
+        
+        with self.engine.connect() as conn:
+            result = conn.execute(query, {'user_id': user_id}).fetchone()
+            return result[0] if result else None
+
     def validate_production_order(self, order_data):
         """Validate production order data"""
         errors = []
@@ -448,6 +468,9 @@ class ProductionManager:
     def _issue_material_fefo(self, conn, issue_id, order_id, material, 
                             required_qty, warehouse_id, group_id, user_id):
         """Issue material using FEFO algorithm"""
+
+        keycloak_id = self.get_keycloak_id_cached(user_id)
+
         # Get available stock ordered by expiry (FEFO)
         fefo_query = text("""
             SELECT 
@@ -539,12 +562,12 @@ class ProductionManager:
             conn.execute(inv_out_query, {
                 'product_id': material['material_id'],
                 'warehouse_id': warehouse_id,
-                'quantity': -take_qty,  # Negative for stockOut
+                'quantity': take_qty,
                 'batch_no': stock.batch_no,
                 'expired_date': stock.expired_date,
                 'detail_id': detail_id,
                 'group_id': group_id,
-                'created_by': user_id
+                'created_by': keycloak_id
             })
             
             # Update material issued quantity
@@ -607,6 +630,8 @@ class ProductionManager:
     
     def create_material_return(self, return_data, user_id):
         """Create material return with validation"""
+        keycloak_id = self.get_keycloak_id_cached(user_id)
+
         conn = self.engine.connect()
         trans = conn.begin()
         
@@ -700,7 +725,7 @@ class ProductionManager:
                         'expired_date': orig_inv['expired_date'] if orig_inv else None,
                         'detail_id': detail_id,
                         'group_id': group_id,
-                        'created_by': user_id
+                        'created_by': keycloak_id
                     })
                 
                 # Update material issued quantity
@@ -818,6 +843,8 @@ class ProductionManager:
     def complete_production(self, order_id, produced_qty, batch_no, 
                           quality_status, notes, created_by):
         """Complete production order"""
+        keycloak_id = self.get_keycloak_id_cached(created_by)
+
         conn = self.engine.connect()
         trans = conn.begin()
         
@@ -894,7 +921,7 @@ class ProductionManager:
                 'expired_date': expiry_date,
                 'receipt_id': receipt_id,
                 'group_id': group_id,
-                'created_by': created_by
+                'created_by': keycloak_id
             })
             
             # Update production order
