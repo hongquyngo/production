@@ -839,10 +839,61 @@ class ProductionManager:
         except Exception as e:
             logger.error(f"Error getting material returns: {e}")
             return pd.DataFrame()
-    
+
+    def _calculate_production_expiry(self, conn, order_id, bom_type):
+        """Calculate expiry date based on production type"""
+        
+        if bom_type == 'KITTING':
+            # Lấy expiry date ngắn nhất từ các components
+            return self._calculate_kit_expiry(conn, order_id)
+        
+        elif bom_type == 'CUTTING':
+            # Kế thừa từ nguyên liệu nguồn
+            query = text("""
+                SELECT MIN(ih.expired_date) as expired_date
+                FROM material_issue_details mid
+                JOIN inventory_histories ih ON ih.id = mid.inventory_history_id
+                WHERE mid.manufacturing_order_id = :order_id
+                AND ih.expired_date IS NOT NULL
+            """)
+            result = conn.execute(query, {'order_id': order_id}).fetchone()
+            return result[0] if result and result[0] else None
+        
+        elif bom_type == 'REPACKING':
+            # Kế thừa từ sản phẩm gốc, có thể giảm shelf life
+            query = text("""
+                SELECT MIN(ih.expired_date) as expired_date
+                FROM material_issue_details mid
+                JOIN inventory_histories ih ON ih.id = mid.inventory_history_id
+                WHERE mid.manufacturing_order_id = :order_id
+                AND ih.expired_date IS NOT NULL
+            """)
+            result = conn.execute(query, {'order_id': order_id}).fetchone()
+            
+            if result and result[0]:
+                # Có thể áp dụng reduction factor nếu cần
+                # Ví dụ: giảm 10% shelf life còn lại do quá trình đóng gói lại
+                # days_remaining = (result[0] - date.today()).days
+                # reduced_days = int(days_remaining * 0.9)
+                # return date.today() + timedelta(days=reduced_days)
+                return result[0]
+            return None
+
+    def get_calculated_expiry_date(self, order_id):
+        """Get calculated expiry date for production order"""
+        conn = self.engine.connect()
+        try:
+            order = self.get_order_details(order_id)
+            if not order:
+                return None
+                
+            return self._calculate_production_expiry(conn, order_id, order['bom_type'])
+        finally:
+            conn.close()
+
     def complete_production(self, order_id, produced_qty, batch_no, 
-                          quality_status, notes, created_by):
-        """Complete production order"""
+                        quality_status, notes, created_by, expired_date=None):
+        """Complete production order với expired_date"""
         keycloak_id = self.get_keycloak_id_cached(created_by)
 
         conn = self.engine.connect()
@@ -854,26 +905,30 @@ class ProductionManager:
             if not order:
                 raise ValueError("Order not found")
             
-            # Validate using embedded validation
+            # Validate
             is_valid, errors = self.validate_production_completion(
                 order, produced_qty, batch_no
             )
             if not is_valid:
                 raise ValueError("; ".join(errors))
             
+            # Calculate expiry date nếu không được cung cấp
+            if expired_date is None:
+                expired_date = self._calculate_production_expiry(conn, order_id, order['bom_type'])
+            
             # Generate receipt number
             receipt_no = self._generate_receipt_number()
             
-            # Create production receipt
+            # Create production receipt với expired_date
             receipt_query = text("""
                 INSERT INTO production_receipts (
                     receipt_no, manufacturing_order_id, receipt_date, 
-                    product_id, quantity, uom, batch_no, warehouse_id, 
-                    quality_status, notes, created_by, created_date
+                    product_id, quantity, uom, batch_no, expired_date,
+                    warehouse_id, quality_status, notes, created_by, created_date
                 ) VALUES (
                     :receipt_no, :order_id, NOW(), :product_id,
-                    :quantity, :uom, :batch_no, :warehouse_id,
-                    :quality_status, :notes, :created_by, NOW()
+                    :quantity, :uom, :batch_no, :expired_date,
+                    :warehouse_id, :quality_status, :notes, :created_by, NOW()
                 )
             """)
             
@@ -884,6 +939,7 @@ class ProductionManager:
                 'quantity': produced_qty,
                 'uom': order['uom'],
                 'batch_no': batch_no,
+                'expired_date': expired_date,  # Lưu vào production_receipts
                 'warehouse_id': order['target_warehouse_id'],
                 'quality_status': quality_status,
                 'notes': notes,
@@ -892,15 +948,10 @@ class ProductionManager:
             
             receipt_id = result.lastrowid
             
-            # Get group_id from material issues
+            # Get group_id
             group_id = self._get_order_group_id(conn, order_id)
             
-            # Calculate expiry date for kitting
-            expiry_date = None
-            if order['bom_type'] == 'KITTING':
-                expiry_date = self._calculate_kit_expiry(conn, order_id)
-            
-            # Add to inventory
+            # Add to inventory với expired_date
             inventory_query = text("""
                 INSERT INTO inventory_histories (
                     type, product_id, warehouse_id, quantity, remain,
@@ -918,7 +969,7 @@ class ProductionManager:
                 'warehouse_id': order['target_warehouse_id'],
                 'quantity': produced_qty,
                 'batch_no': batch_no,
-                'expired_date': expiry_date,
+                'expired_date': expired_date,  # Lưu vào inventory_histories
                 'receipt_id': receipt_id,
                 'group_id': group_id,
                 'created_by': keycloak_id
@@ -942,12 +993,13 @@ class ProductionManager:
             })
             
             trans.commit()
-            logger.info(f"Completed production order {order_id}")
+            logger.info(f"Completed production order {order_id} with expiry date {expired_date}")
             
             return {
                 'receipt_no': receipt_no,
                 'batch_no': batch_no,
-                'quantity': produced_qty
+                'quantity': produced_qty,
+                'expired_date': expired_date
             }
             
         except Exception as e:
@@ -956,7 +1008,42 @@ class ProductionManager:
             raise
         finally:
             conn.close()
-    
+
+    def preview_production_expiry(self, order_id):
+        """Preview expiry date calculation với details"""
+        conn = self.engine.connect()
+        try:
+            order = self.get_order_details(order_id)
+            if not order:
+                return None
+            
+            # Get material expiry details
+            query = text("""
+                SELECT 
+                    p.name as material_name,
+                    ih.batch_no,
+                    ih.expired_date,
+                    DATEDIFF(ih.expired_date, CURDATE()) as days_remaining
+                FROM material_issue_details mid
+                JOIN inventory_histories ih ON ih.id = mid.inventory_history_id
+                JOIN products p ON p.id = mid.material_id
+                WHERE mid.manufacturing_order_id = :order_id
+                AND ih.expired_date IS NOT NULL
+                ORDER BY ih.expired_date ASC
+            """)
+            
+            materials = pd.read_sql(query, conn, params={'order_id': order_id})
+            
+            calculated_expiry = self._calculate_production_expiry(conn, order_id, order['bom_type'])
+            
+            return {
+                'calculated_expiry': calculated_expiry,
+                'bom_type': order['bom_type'],
+                'materials': materials
+            }
+        finally:
+            conn.close()
+
     def _get_order_group_id(self, conn, order_id):
         """Get or generate group ID for order"""
         query = text("""

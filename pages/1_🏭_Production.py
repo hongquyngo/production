@@ -701,7 +701,7 @@ elif st.session_state.current_view == 'complete':
         materials = prod_manager.get_order_material_summary(selected_order_id)
         
         if not materials.empty:
-            # Display with efficiency calculation
+            # Display materials table...
             materials_display = []
             for _, mat in materials.iterrows():
                 efficiency = 0
@@ -726,9 +726,12 @@ elif st.session_state.current_view == 'complete':
         # Production completion form
         st.markdown("### Production Results")
         
+        # Calculate expiry date
+        calculated_expiry = prod_manager.get_calculated_expiry_date(selected_order_id)
+        
         col1, col2 = st.columns(2)
         with col1:
-            # Get tolerance from config (hardcoded for now)
+            # Get tolerance from config
             tolerance = 1.1  # 10% over-production allowed
             max_allowed = int(order_info['planned_qty'] * tolerance)
             
@@ -749,9 +752,47 @@ elif st.session_state.current_view == 'complete':
         with col2:
             quality_status = st.selectbox("Quality Status", ["PASSED", "FAILED", "PENDING"])
             
-            # For kitting, show expiry date info
+            # Expiry date handling với info theo process type
+            st.markdown("#### Expiry Date")
+            
+            # Show info based on BOM type
             if order_info['bom_type'] == 'KITTING':
-                st.info("ℹ️ Kit will inherit the shortest expiry date from its components")
+                st.info("ℹ️ Kit inherits the shortest expiry date from its components")
+            elif order_info['bom_type'] == 'CUTTING':
+                st.info("ℹ️ Cut products inherit expiry date from source material")
+            elif order_info['bom_type'] == 'REPACKING':
+                st.info("ℹ️ Repacked products inherit expiry date from original product")
+            
+            # Display calculated expiry
+            if calculated_expiry:
+                days_until_expiry = (calculated_expiry - date.today()).days
+                
+                if days_until_expiry < 30:
+                    st.warning(f"⚠️ Calculated expiry: {calculated_expiry.strftime('%Y-%m-%d')} ({days_until_expiry} days)")
+                else:
+                    st.success(f"📅 Calculated expiry: {calculated_expiry.strftime('%Y-%m-%d')} ({days_until_expiry} days)")
+                
+                # Allow manual override
+                use_calculated = st.checkbox("Use calculated expiry date", value=True)
+                
+                if use_calculated:
+                    expiry_date = calculated_expiry
+                else:
+                    expiry_date = st.date_input(
+                        "Manual Expiry Date",
+                        value=calculated_expiry,
+                        min_value=date.today(),
+                        help="Override the calculated expiry date if needed"
+                    )
+            else:
+                st.warning("⚠️ No expiry date could be calculated from materials")
+                # Manual input required
+                expiry_date = st.date_input(
+                    "Manual Expiry Date",
+                    value=None,
+                    min_value=date.today(),
+                    help="Please set expiry date manually"
+                )
             
             notes = st.text_area("Production Notes", height=100)
         
@@ -763,31 +804,37 @@ elif st.session_state.current_view == 'complete':
                     st.error("Produced quantity must be greater than 0")
                 elif not batch_no:
                     st.error("Batch number is required")
+                elif not expiry_date:
+                    st.error("Expiry date is required")
                 else:
                     try:
-                        # Create production receipt
+                        # Create production receipt với expiry date
                         receipt_result = prod_manager.complete_production(
                             order_id=selected_order_id,
                             produced_qty=produced_qty,
                             batch_no=batch_no,
                             quality_status=quality_status,
                             notes=notes,
-                            created_by=st.session_state.user_id
+                            created_by=st.session_state.user_id,
+                            expired_date=expiry_date  # Pass expiry date
                         )
                         
                         st.success(f"✅ Production completed! Receipt No: {receipt_result['receipt_no']}")
                         st.balloons()
                         
-                        # Show summary
+                        # Show summary với expiry info
                         with st.container():
                             st.markdown("### Production Summary")
                             summary_col1, summary_col2 = st.columns(2)
                             with summary_col1:
                                 st.write(f"**Product:** {order_info['product_name']}")
                                 st.write(f"**Quantity:** {produced_qty} {order_info['uom']}")
-                            with summary_col2:
                                 st.write(f"**Batch:** {batch_no}")
+                            with summary_col2:
                                 st.write(f"**Location:** {order_info['target_warehouse_name']}")
+                                st.write(f"**Expiry Date:** {expiry_date.strftime('%Y-%m-%d')}")
+                                days_shelf_life = (expiry_date - date.today()).days
+                                st.write(f"**Shelf Life:** {days_shelf_life} days")
                         
                         time.sleep(3)
                         st.session_state.current_view = 'list'
