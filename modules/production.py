@@ -1,16 +1,22 @@
-# modules/production.py - Complete Production Management (Fixed)
+# modules/production.py - Complete Production Management (Enhanced)
 """
 Production Order Management Module
 Handles the complete production cycle: Order → Issue → Return → Complete
-Fixed version with warehouse_id included in queries
+Enhanced version with:
+- Fixed inventory transaction quantities (all positive)
+- Return quantity validation
+- Actual material usage tracking
+- Production efficiency metrics
+- Partial production cycle support
 """
 
 import logging
-from datetime import datetime, date
-from decimal import Decimal
+from datetime import datetime, date, timedelta
+from decimal import Decimal, ROUND_UP
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
 import uuid
+import math
 
 import pandas as pd
 from sqlalchemy import text
@@ -39,6 +45,13 @@ class Priority(Enum):
     NORMAL = "NORMAL"
     HIGH = "HIGH"
     URGENT = "URGENT"
+
+
+class RoundingStrategy(Enum):
+    """Material requirement rounding strategy"""
+    ALWAYS_UP = "ALWAYS_UP"  # Always round up (default)
+    ALLOW_PARTIAL = "ALLOW_PARTIAL"  # Allow partial cycles
+    NEAREST = "NEAREST"  # Round to nearest
 
 
 # ==================== Main Manager ====================
@@ -101,8 +114,9 @@ class ProductionManager:
                 
                 order_id = result.lastrowid
                 
-                # Create material requirements
-                self._create_material_requirements(conn, order_id, order_data)
+                # Create material requirements with rounding strategy
+                rounding_strategy = order_data.get('rounding_strategy', RoundingStrategy.ALWAYS_UP)
+                self._create_material_requirements(conn, order_id, order_data, rounding_strategy)
                 
                 logger.info(f"Created production order {order_no}")
                 return order_no
@@ -128,14 +142,18 @@ class ProductionManager:
         next_num = result.fetchone()['next_num']
         return f"MO-{timestamp}-{next_num:04d}"
     
-    def _create_material_requirements(self, conn, order_id: int, order_data: Dict):
-        """Create material requirements from BOM"""
+    def _create_material_requirements(self, conn, order_id: int, order_data: Dict,
+                                     rounding_strategy: RoundingStrategy = RoundingStrategy.ALWAYS_UP):
+        """Create material requirements from BOM with flexible rounding"""
         # Get BOM details
         bom_query = text("""
             SELECT 
                 d.material_id,
-                d.quantity * :planned_qty / h.output_qty * (1 + d.scrap_rate/100) as required_qty,
-                d.uom
+                d.quantity,
+                d.uom,
+                d.scrap_rate,
+                h.output_qty,
+                :planned_qty as planned_qty
             FROM bom_details d
             JOIN bom_headers h ON d.bom_header_id = h.id
             WHERE h.id = :bom_id
@@ -146,8 +164,25 @@ class ProductionManager:
             'planned_qty': float(order_data['planned_qty'])
         })
         
-        # Insert requirements
+        # Calculate and insert requirements
         for mat in materials:
+            # Calculate production cycles
+            production_cycles = float(mat['planned_qty']) / float(mat['output_qty'])
+            
+            # Calculate base material need
+            base_material = production_cycles * float(mat['quantity'])
+            
+            # Apply scrap rate
+            with_scrap = base_material * (1 + float(mat['scrap_rate']) / 100)
+            
+            # Apply rounding strategy
+            if rounding_strategy == RoundingStrategy.ALWAYS_UP:
+                required_qty = math.ceil(with_scrap)
+            elif rounding_strategy == RoundingStrategy.ALLOW_PARTIAL:
+                required_qty = with_scrap  # Keep exact amount
+            else:  # NEAREST
+                required_qty = round(with_scrap)
+            
             insert_query = text("""
                 INSERT INTO manufacturing_order_materials (
                     manufacturing_order_id, material_id, required_qty,
@@ -161,7 +196,7 @@ class ProductionManager:
             conn.execute(insert_query, {
                 'order_id': order_id,
                 'material_id': mat['material_id'],
-                'required_qty': mat['required_qty'],
+                'required_qty': required_qty,
                 'uom': mat['uom'],
                 'warehouse_id': order_data['warehouse_id']
             })
@@ -274,6 +309,7 @@ class ProductionManager:
             
             # Skip expired batches
             if batch['expired_date'] and batch['expired_date'] < date.today():
+                logger.warning(f"Skipping expired batch {batch['batch_no']}")
                 continue
             
             # Calculate quantity to take
@@ -315,7 +351,7 @@ class ProductionManager:
                 'inventory_id': batch['id']
             })
             
-            # Create stock out record
+            # Create stock out record - FIXED: Use positive quantity
             stock_out_query = text("""
                 INSERT INTO inventory_histories (
                     type, product_id, warehouse_id, quantity, remain,
@@ -331,7 +367,7 @@ class ProductionManager:
             conn.execute(stock_out_query, {
                 'material_id': material['material_id'],
                 'warehouse_id': warehouse_id,
-                'quantity': -take_qty,
+                'quantity': take_qty,  # FIXED: Positive value
                 'batch_no': batch['batch_no'],
                 'expired_date': batch['expired_date'],
                 'detail_id': detail_id,
@@ -363,18 +399,61 @@ class ProductionManager:
                 'material_name': material['material_name'],
                 'batch_no': batch['batch_no'],
                 'quantity': take_qty,
-                'uom': material['uom']
+                'uom': material['uom'],
+                'expired_date': batch['expired_date']
             })
             
             remaining -= take_qty
         
+        # Log if insufficient stock
+        if remaining > 0:
+            logger.warning(f"Insufficient stock for material {material['material_id']}: "
+                         f"short by {remaining} {material['uom']}")
+        
         return issued_details
     
-    # ==================== Material Return ====================
+    # ==================== Material Return with Validation ====================
+    
+    def validate_return_quantity(self, issue_detail_id: int, return_qty: float) -> bool:
+        """Validate return quantity doesn't exceed issued quantity"""
+        query = """
+            SELECT 
+                mid.quantity as issued_qty,
+                COALESCE(SUM(mrd.quantity), 0) as previously_returned
+            FROM material_issue_details mid
+            LEFT JOIN material_return_details mrd 
+                ON mrd.original_issue_detail_id = mid.id
+            LEFT JOIN material_returns mr 
+                ON mr.id = mrd.material_return_id AND mr.status = 'CONFIRMED'
+            WHERE mid.id = %s
+            GROUP BY mid.quantity
+        """
+        
+        try:
+            result = pd.read_sql(query, self.engine, params=(issue_detail_id,))
+            if result.empty:
+                raise ValueError(f"Issue detail {issue_detail_id} not found")
+            
+            row = result.iloc[0]
+            total_returns = float(row['previously_returned']) + return_qty
+            
+            if total_returns > float(row['issued_qty']):
+                raise ValueError(
+                    f"Cannot return {return_qty}. "
+                    f"Issued: {row['issued_qty']}, "
+                    f"Previously returned: {row['previously_returned']}, "
+                    f"Total would be: {total_returns}"
+                )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating return quantity: {e}")
+            raise
     
     def return_materials(self, order_id: int, returns: List[Dict],
                         reason: str, user_id: int) -> Dict[str, Any]:
-        """Return unused materials"""
+        """Return unused materials with validation"""
         with self.engine.begin() as conn:
             try:
                 # Get order info
@@ -395,6 +474,13 @@ class ProductionManager:
                 issue = issue_result.fetchone()
                 if not issue:
                     raise ValueError("No material issue found for this order")
+                
+                # Validate all returns before processing
+                for ret in returns:
+                    self.validate_return_quantity(
+                        ret['issue_detail_id'], 
+                        ret['quantity']
+                    )
                 
                 # Generate return number
                 return_no = self._generate_return_number(conn)
@@ -450,7 +536,7 @@ class ProductionManager:
                         'expired_date': ret.get('expired_date')
                     })
                     
-                    # Create stock in record
+                    # Create stock in record - Positive quantity
                     stock_in_query = text("""
                         INSERT INTO inventory_histories (
                             type, product_id, warehouse_id, quantity, remain,
@@ -465,7 +551,7 @@ class ProductionManager:
                     conn.execute(stock_in_query, {
                         'material_id': ret['material_id'],
                         'warehouse_id': order['warehouse_id'],
-                        'quantity': ret['quantity'],
+                        'quantity': ret['quantity'],  # Positive value
                         'batch_no': ret['batch_no'],
                         'expired_date': ret.get('expired_date'),
                         'created_by': str(user_id)
@@ -474,7 +560,8 @@ class ProductionManager:
                     return_details.append({
                         'material_id': ret['material_id'],
                         'batch_no': ret['batch_no'],
-                        'quantity': ret['quantity']
+                        'quantity': ret['quantity'],
+                        'condition': ret.get('condition', 'GOOD')
                     })
                 
                 logger.info(f"Returned materials for order {order_id}")
@@ -512,7 +599,6 @@ class ProductionManager:
                 
                 # Calculate expiry if not provided
                 if not expired_date and order.get('shelf_life'):
-                    from datetime import timedelta
                     expired_date = date.today() + timedelta(days=order['shelf_life'])
                 
                 # Create production receipt
@@ -546,7 +632,7 @@ class ProductionManager:
                 
                 receipt_id = receipt_result.lastrowid
                 
-                # Create stock in record
+                # Create stock in record - Positive quantity
                 stock_in_query = text("""
                     INSERT INTO inventory_histories (
                         type, product_id, warehouse_id, quantity, remain,
@@ -562,7 +648,7 @@ class ProductionManager:
                 conn.execute(stock_in_query, {
                     'product_id': order['product_id'],
                     'warehouse_id': order['target_warehouse_id'],
-                    'quantity': produced_qty,
+                    'quantity': produced_qty,  # Positive value
                     'batch_no': batch_no,
                     'expired_date': expired_date,
                     'receipt_id': receipt_id,
@@ -600,6 +686,124 @@ class ProductionManager:
                 logger.error(f"Error completing production: {e}")
                 raise
     
+    # ==================== Material Usage & Efficiency ====================
+    
+    def get_actual_material_usage(self, order_id: int) -> pd.DataFrame:
+        """Calculate actual material usage = issued - returned"""
+        query = """
+            SELECT 
+                mom.material_id,
+                p.name as material_name,
+                mom.required_qty,
+                COALESCE(mom.issued_qty, 0) as issued_qty,
+                COALESCE(returns.returned_qty, 0) as returned_qty,
+                COALESCE(mom.issued_qty, 0) - COALESCE(returns.returned_qty, 0) as actual_used_qty,
+                mom.uom,
+                CASE 
+                    WHEN mom.required_qty > 0 AND mom.issued_qty > 0 
+                    THEN ROUND(((COALESCE(mom.issued_qty, 0) - COALESCE(returns.returned_qty, 0)) / mom.required_qty * 100), 2)
+                    ELSE 0 
+                END as usage_efficiency_pct,
+                CASE
+                    WHEN COALESCE(mom.issued_qty, 0) - COALESCE(returns.returned_qty, 0) > mom.required_qty 
+                    THEN 'OVER_USED'
+                    WHEN COALESCE(mom.issued_qty, 0) - COALESCE(returns.returned_qty, 0) < mom.required_qty 
+                    THEN 'UNDER_USED'
+                    ELSE 'EXACT'
+                END as usage_status
+            FROM manufacturing_order_materials mom
+            JOIN products p ON p.id = mom.material_id
+            LEFT JOIN (
+                SELECT 
+                    mr.manufacturing_order_id,
+                    mrd.material_id,
+                    SUM(mrd.quantity) as returned_qty
+                FROM material_return_details mrd
+                JOIN material_returns mr ON mr.id = mrd.material_return_id
+                WHERE mr.status = 'CONFIRMED'
+                GROUP BY mr.manufacturing_order_id, mrd.material_id
+            ) returns ON returns.manufacturing_order_id = mom.manufacturing_order_id
+                AND returns.material_id = mom.material_id
+            WHERE mom.manufacturing_order_id = %s
+            ORDER BY p.name
+        """
+        
+        try:
+            return pd.read_sql(query, self.engine, params=(order_id,))
+        except Exception as e:
+            logger.error(f"Error getting actual material usage: {e}")
+            return pd.DataFrame()
+    
+    def calculate_production_efficiency(self, order_id: int) -> Dict[str, Any]:
+        """Calculate comprehensive production efficiency metrics"""
+        try:
+            # Get order details
+            order = self.get_order_details(order_id)
+            if not order:
+                return {}
+            
+            # Production efficiency
+            production_efficiency = 0
+            if order['planned_qty'] > 0:
+                production_efficiency = (order['produced_qty'] / order['planned_qty']) * 100
+            
+            # Material usage efficiency
+            material_usage = self.get_actual_material_usage(order_id)
+            
+            # Calculate weighted average material efficiency
+            total_material_cost = 0
+            weighted_efficiency = 0
+            
+            if not material_usage.empty:
+                # Note: You need to add unit_cost to the query or fetch it separately
+                for _, mat in material_usage.iterrows():
+                    # Simplified calculation - you may want to get actual costs
+                    material_value = mat['actual_used_qty']  # * unit_cost
+                    total_material_cost += material_value
+                    weighted_efficiency += mat['usage_efficiency_pct'] * material_value
+                
+                if total_material_cost > 0:
+                    weighted_efficiency = weighted_efficiency / total_material_cost
+            
+            # Time efficiency
+            time_efficiency = None
+            if order.get('completion_date') and order.get('scheduled_date'):
+                scheduled = pd.to_datetime(order['scheduled_date'])
+                completed = pd.to_datetime(order['completion_date'])
+                days_diff = (completed - scheduled).days
+                
+                if days_diff <= 0:
+                    time_efficiency = 100  # On time or early
+                else:
+                    time_efficiency = max(0, 100 - (days_diff * 10))  # -10% per day late
+            
+            # Scrap rate calculation
+            total_scrap = 0
+            if not material_usage.empty:
+                total_scrap = material_usage[
+                    material_usage['actual_used_qty'] > material_usage['required_qty']
+                ]['actual_used_qty'].sum() - material_usage[
+                    material_usage['actual_used_qty'] > material_usage['required_qty']
+                ]['required_qty'].sum()
+            
+            return {
+                'order_id': order_id,
+                'order_no': order.get('order_no'),
+                'production_efficiency_pct': round(production_efficiency, 2),
+                'material_efficiency_pct': round(weighted_efficiency, 2) if weighted_efficiency else None,
+                'time_efficiency_pct': round(time_efficiency, 2) if time_efficiency else None,
+                'total_material_cost': total_material_cost,
+                'total_scrap_qty': total_scrap,
+                'material_details': material_usage.to_dict('records') if not material_usage.empty else [],
+                'status': order['status'],
+                'planned_qty': order['planned_qty'],
+                'produced_qty': order['produced_qty']
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating production efficiency: {e}")
+            return {}
+    
     # ==================== Query Methods ====================
     
     def get_orders(self, status: Optional[str] = None,
@@ -608,7 +812,7 @@ class ProductionManager:
                   to_date: Optional[date] = None,
                   priority: Optional[str] = None,
                   page: int = 1, page_size: int = 100) -> pd.DataFrame:
-        """Get production orders with filters - FIXED to include warehouse IDs"""
+        """Get production orders with filters - includes warehouse IDs"""
         query = """
             SELECT 
                 o.id,
@@ -807,10 +1011,76 @@ class ProductionManager:
                 logger.error(f"Error updating order status: {e}")
                 return False
     
+    # ==================== Analytics & Reports ====================
+    
+    def get_production_summary(self, from_date: date, to_date: date) -> Dict[str, Any]:
+        """Get production summary statistics"""
+        try:
+            # Orders summary
+            orders_query = """
+                SELECT 
+                    COUNT(*) as total_orders,
+                    SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed_orders,
+                    SUM(CASE WHEN status = 'IN_PROGRESS' THEN 1 ELSE 0 END) as in_progress_orders,
+                    SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) as cancelled_orders,
+                    AVG(CASE WHEN status = 'COMPLETED' THEN produced_qty / planned_qty * 100 ELSE NULL END) as avg_completion_rate
+                FROM manufacturing_orders
+                WHERE order_date BETWEEN %s AND %s
+                    AND delete_flag = 0
+            """
+            
+            orders_stats = pd.read_sql(orders_query, self.engine, params=(from_date, to_date))
+            
+            # Material efficiency
+            material_query = """
+                SELECT 
+                    AVG(efficiency.usage_efficiency_pct) as avg_material_efficiency
+                FROM (
+                    SELECT 
+                        mo.id,
+                        AVG(CASE 
+                            WHEN mom.required_qty > 0 
+                            THEN ((mom.issued_qty - COALESCE(ret.returned_qty, 0)) / mom.required_qty * 100)
+                            ELSE 0 
+                        END) as usage_efficiency_pct
+                    FROM manufacturing_orders mo
+                    JOIN manufacturing_order_materials mom ON mom.manufacturing_order_id = mo.id
+                    LEFT JOIN (
+                        SELECT 
+                            mr.manufacturing_order_id,
+                            mrd.material_id,
+                            SUM(mrd.quantity) as returned_qty
+                        FROM material_return_details mrd
+                        JOIN material_returns mr ON mr.id = mrd.material_return_id
+                        WHERE mr.status = 'CONFIRMED'
+                        GROUP BY mr.manufacturing_order_id, mrd.material_id
+                    ) ret ON ret.manufacturing_order_id = mo.id AND ret.material_id = mom.material_id
+                    WHERE mo.order_date BETWEEN %s AND %s
+                        AND mo.status = 'COMPLETED'
+                        AND mo.delete_flag = 0
+                    GROUP BY mo.id
+                ) efficiency
+            """
+            
+            material_stats = pd.read_sql(material_query, self.engine, params=(from_date, to_date))
+            
+            return {
+                'period': {
+                    'from_date': from_date.isoformat(),
+                    'to_date': to_date.isoformat()
+                },
+                'orders': orders_stats.iloc[0].to_dict() if not orders_stats.empty else {},
+                'material_efficiency': material_stats.iloc[0].to_dict() if not material_stats.empty else {}
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting production summary: {e}")
+            return {}
+    
     # ==================== Helper Methods ====================
     
     def _get_order_info(self, conn, order_id: int) -> Optional[Dict]:
-        """Get order information"""
+        """Get order information for internal use"""
         query = text("""
             SELECT o.*, b.bom_type, p.shelf_life
             FROM manufacturing_orders o
