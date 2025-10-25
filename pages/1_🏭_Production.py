@@ -1,4 +1,4 @@
-# pages/1_🏭_Production.py - Complete Production Management UI
+# pages/1_🏭_Production.py
 """
 Production Management User Interface
 Complete production cycle: Order → Issue → Return → Complete
@@ -7,18 +7,31 @@ Complete production cycle: Order → Issue → Return → Complete
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import time
 import logging
 
+# Production domain imports
 from utils.auth import AuthManager
-from modules.production import ProductionManager
-from modules.inventory import InventoryManager
-from modules.bom import BOMManager
-from modules.common import (
-    format_number, format_currency, create_status_indicator,
-    export_to_excel, get_date_filter_presets, UIHelpers,
-    SystemConstants
+from utils.db import get_db_engine
+from utils.production.manager import ProductionManager
+from utils.production.inventory import InventoryManager
+from utils.production.materials import (
+    issue_materials,
+    return_materials,
+    complete_production,
+    get_returnable_materials
+)
+from utils.production.common import (
+    format_number,
+    create_status_indicator,
+    export_to_excel,
+    get_date_filter_presets,
+    calculate_percentage,
+    UIHelpers,
+    SystemConstants,
+    validate_positive_number,
+    validate_required_fields
 )
 
 logger = logging.getLogger(__name__)
@@ -42,13 +55,9 @@ auth.require_auth()
 @st.cache_resource
 def get_managers():
     """Initialize and cache managers"""
-    return (
-        ProductionManager(),
-        InventoryManager(),
-        BOMManager()
-    )
+    return ProductionManager(), InventoryManager()
 
-prod_manager, inv_manager, bom_manager = get_managers()
+prod_manager, inv_manager = get_managers()
 
 # ==================== Session State ====================
 
@@ -57,8 +66,6 @@ def initialize_session_state():
     defaults = {
         'current_view': 'list',
         'selected_order': None,
-        'form_data': {},
-        'filters': {},
         'page_number': 1
     }
     
@@ -106,6 +113,7 @@ def render_navigation():
                 type="primary" if is_active else "secondary"
             ):
                 set_view(view)
+                st.rerun()
 
 # ==================== Order List View ====================
 
@@ -171,7 +179,7 @@ def render_order_list():
         in_progress = len(orders[orders['status'] == 'IN_PROGRESS'])
         st.metric("In Progress", in_progress)
     with col4:
-        completion_rate = (completed / len(orders) * 100) if len(orders) > 0 else 0
+        completion_rate = calculate_percentage(completed, len(orders))
         st.metric("Completion Rate", f"{completion_rate:.1f}%")
     
     st.markdown("---")
@@ -200,7 +208,8 @@ def render_order_list():
     with col1:
         selected_order = st.selectbox(
             "Select Order",
-            orders['order_no'].tolist()
+            orders['order_no'].tolist(),
+            key="order_list_select"
         )
     
     if selected_order:
@@ -208,7 +217,7 @@ def render_order_list():
         
         with col2:
             actions = get_available_actions(order_row['status'])
-            action = st.selectbox("Action", actions)
+            action = st.selectbox("Action", actions, key="order_list_action")
         
         with col3:
             st.markdown("<br>", unsafe_allow_html=True)
@@ -254,12 +263,32 @@ def execute_action(action: str, order_id: int, status: str):
                 st.rerun()
     except Exception as e:
         UIHelpers.show_message(f"Error: {str(e)}", "error")
+        logger.error(f"Action execution failed: {e}", exc_info=True)
 
 # ==================== Create Order View ====================
 
 def render_create_order():
     """Render create order form"""
     st.subheader("➕ Create New Production Order")
+    
+    # Get warehouses first
+    warehouses = inv_manager.get_warehouses()
+    
+    if warehouses.empty:
+        st.error("❌ No warehouses found! Please configure warehouses first.")
+        if st.button("← Back to List"):
+            set_view('list')
+            st.rerun()
+        return
+    
+    # Validate warehouse data
+    if 'name' not in warehouses.columns or 'id' not in warehouses.columns:
+        st.error("❌ Warehouse data is invalid. Please check database configuration.")
+        logger.error(f"Invalid warehouse columns: {warehouses.columns.tolist()}")
+        if st.button("← Back to List"):
+            set_view('list')
+            st.rerun()
+        return
     
     # BOM Type selection
     prod_type = st.selectbox(
@@ -268,10 +297,13 @@ def render_create_order():
     )
     
     # Get BOMs
-    boms = bom_manager.get_active_boms(bom_type=prod_type)
+    boms = prod_manager.get_active_boms(bom_type=prod_type)
     
     if boms.empty:
         st.warning(f"No active BOMs found for {prod_type}")
+        if st.button("← Back to List"):
+            set_view('list')
+            st.rerun()
         return
     
     with st.form("create_order_form"):
@@ -292,7 +324,7 @@ def render_create_order():
             bom_id = bom_options[selected_bom]
             
             # Get BOM info
-            bom_info = bom_manager.get_bom_info(bom_id)
+            bom_info = prod_manager.get_bom_info(bom_id)
             if bom_info:
                 st.info(f"Output: {bom_info['product_name']} - {bom_info['output_qty']} {bom_info['uom']}")
             
@@ -312,19 +344,26 @@ def render_create_order():
             )
         
         with col2:
-            # Warehouses
-            warehouses = inv_manager.get_warehouses()
+            # Prepare warehouse data
             warehouse_names = warehouses['name'].tolist()
+            warehouse_dict = dict(zip(warehouses['name'], warehouses['id']))
             
+            if len(warehouse_names) < 2:
+                st.error("❌ Need at least 2 warehouses (source and target)")
+                st.stop()
+            
+            # Source warehouse
             source_warehouse = st.selectbox(
                 "Source Warehouse",
                 warehouse_names
             )
             
+            # Target warehouse (exclude source)
+            target_options = [w for w in warehouse_names if w != source_warehouse]
             target_warehouse = st.selectbox(
                 "Target Warehouse",
-                warehouse_names,
-                index=1 if len(warehouse_names) > 1 else 0
+                target_options,
+                index=0
             )
             
             # Priority
@@ -339,17 +378,23 @@ def render_create_order():
         
         # Material preview
         if bom_id and source_warehouse:
-            source_id = warehouses[warehouses['name'] == source_warehouse]['id'].iloc[0]
+            source_id = warehouse_dict[source_warehouse]
             requirements = prod_manager.calculate_material_requirements(bom_id, qty)
             
             if not requirements.empty:
                 st.markdown("### Material Requirements")
                 
-                # Check availability
-                for idx, row in requirements.iterrows():
-                    stock = inv_manager.get_stock_balance(row['material_id'], source_id)
-                    requirements.loc[idx, 'available'] = stock
-                    requirements.loc[idx, 'status'] = '✅' if stock >= row['required_qty'] else '❌'
+                # Batch check availability
+                material_ids = requirements['material_id'].tolist()
+                stock_balances = inv_manager.get_stock_balances(material_ids, source_id)
+                
+                requirements['available'] = requirements['material_id'].map(
+                    lambda x: float(stock_balances.get(x, 0))
+                )
+                requirements['status'] = requirements.apply(
+                    lambda x: '✅' if x['available'] >= x['required_qty'] else '❌',
+                    axis=1
+                )
                 
                 st.dataframe(
                     requirements[['material_name', 'required_qty', 'available', 'status']],
@@ -357,7 +402,7 @@ def render_create_order():
                     hide_index=True
                 )
         
-        # Submit
+        # Submit buttons
         col1, col2, col3 = st.columns([3, 1, 1])
         with col2:
             submitted = st.form_submit_button("Create Order", type="primary", use_container_width=True)
@@ -366,13 +411,21 @@ def render_create_order():
         
         if submitted:
             try:
+                # Validate
+                if source_warehouse not in warehouse_dict or target_warehouse not in warehouse_dict:
+                    raise ValueError("Invalid warehouse selection")
+                
+                if source_warehouse == target_warehouse:
+                    raise ValueError("Source and target warehouse must be different")
+                
+                # Create order
                 order_data = {
                     'bom_header_id': bom_id,
                     'product_id': bom_info['product_id'],
                     'planned_qty': qty,
                     'uom': bom_info['uom'],
-                    'warehouse_id': warehouses[warehouses['name'] == source_warehouse]['id'].iloc[0],
-                    'target_warehouse_id': warehouses[warehouses['name'] == target_warehouse]['id'].iloc[0],
+                    'warehouse_id': warehouse_dict[source_warehouse],
+                    'target_warehouse_id': warehouse_dict[target_warehouse],
                     'scheduled_date': scheduled_date,
                     'priority': priority,
                     'notes': notes,
@@ -387,6 +440,7 @@ def render_create_order():
                 
             except Exception as e:
                 UIHelpers.show_message(f"Error: {str(e)}", "error")
+                logger.error(f"Order creation failed: {e}", exc_info=True)
         
         if cancel:
             set_view('list')
@@ -399,17 +453,16 @@ def render_material_issue():
     st.subheader("📦 Material Issue")
     
     # Get eligible orders
-    orders = prod_manager.get_orders(status='DRAFT')
-    confirmed = prod_manager.get_orders(status='CONFIRMED')
+    orders_draft = prod_manager.get_orders(status='DRAFT')
+    orders_confirmed = prod_manager.get_orders(status='CONFIRMED')
     
-    if not orders.empty and not confirmed.empty:
-        all_orders = pd.concat([orders, confirmed])
-    elif not orders.empty:
-        all_orders = orders
-    elif not confirmed.empty:
-        all_orders = confirmed
-    else:
+    all_orders = pd.concat([orders_draft, orders_confirmed]) if not orders_draft.empty and not orders_confirmed.empty else (orders_draft if not orders_draft.empty else orders_confirmed)
+    
+    if all_orders.empty:
         st.info("No orders available for material issue")
+        if st.button("← Back to List"):
+            set_view('list')
+            st.rerun()
         return
     
     # Order selection
@@ -445,14 +498,17 @@ def render_material_issue():
         
         st.markdown("### Material Requirements")
         
-        # Check availability
-        for idx, mat in materials.iterrows():
-            stock = inv_manager.get_stock_balance(
-                mat['material_id'], 
-                all_orders.iloc[0]['warehouse_id']
-            )
-            materials.loc[idx, 'available'] = stock
-            materials.loc[idx, 'status'] = '✅' if stock >= mat['pending_qty'] else '❌'
+        # Batch check availability
+        material_ids = materials['material_id'].tolist()
+        stock_balances = inv_manager.get_stock_balances(material_ids, order_info['warehouse_id'])
+        
+        materials['available'] = materials['material_id'].map(
+            lambda x: float(stock_balances.get(x, 0))
+        )
+        materials['status'] = materials.apply(
+            lambda x: '✅' if x['available'] >= x['pending_qty'] else '❌',
+            axis=1
+        )
         
         st.dataframe(
             materials[['material_name', 'required_qty', 'issued_qty', 
@@ -464,11 +520,18 @@ def render_material_issue():
         # Issue button
         all_available = not any('❌' in str(s) for s in materials['status'])
         
-        if all_available:
-            st.success("✅ All materials available")
-            if st.button("📤 Issue Materials", type="primary", use_container_width=True):
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            if all_available:
+                st.success("✅ All materials available")
+            else:
+                st.error("❌ Insufficient stock for some materials")
+        
+        with col2:
+            if all_available and st.button("📤 Issue Materials", type="primary", use_container_width=True):
                 try:
-                    result = prod_manager.issue_materials(order_id, st.session_state.user_id)
+                    result = issue_materials(order_id, st.session_state.user_id)
                     UIHelpers.show_message(
                         f"✅ Materials issued! Issue No: {result['issue_no']}", 
                         "success"
@@ -484,8 +547,7 @@ def render_material_issue():
                     
                 except Exception as e:
                     UIHelpers.show_message(f"Error: {str(e)}", "error")
-        else:
-            st.error("❌ Insufficient stock for some materials")
+                    logger.error(f"Material issue failed: {e}", exc_info=True)
 
 # ==================== Material Return View ====================
 
@@ -498,6 +560,9 @@ def render_material_return():
     
     if orders.empty:
         st.info("No orders available for material return")
+        if st.button("← Back to List"):
+            set_view('list')
+            st.rerun()
         return
     
     # Order selection
@@ -513,7 +578,7 @@ def render_material_return():
         order_id = orders.iloc[idx]['id']
         
         # Get returnable materials
-        returnable = prod_manager.get_returnable_materials(order_id)
+        returnable = get_returnable_materials(order_id)
         
         if returnable.empty:
             st.info("No materials available for return")
@@ -569,22 +634,24 @@ def render_material_return():
             # Submit
             submitted = st.form_submit_button("Process Return", type="primary", use_container_width=True)
             
-            if submitted and returns:
-                try:
-                    result = prod_manager.return_materials(
-                        order_id, returns, reason, st.session_state.user_id
-                    )
-                    UIHelpers.show_message(
-                        f"✅ Materials returned! Return No: {result['return_no']}",
-                        "success"
-                    )
-                    time.sleep(2)
-                    st.rerun()
-                    
-                except Exception as e:
-                    UIHelpers.show_message(f"Error: {str(e)}", "error")
-            elif submitted:
-                st.warning("No materials selected for return")
+            if submitted:
+                if not returns:
+                    st.warning("No materials selected for return")
+                else:
+                    try:
+                        result = return_materials(
+                            order_id, returns, reason, st.session_state.user_id
+                        )
+                        UIHelpers.show_message(
+                            f"✅ Materials returned! Return No: {result['return_no']}",
+                            "success"
+                        )
+                        time.sleep(2)
+                        st.rerun()
+                        
+                    except Exception as e:
+                        UIHelpers.show_message(f"Error: {str(e)}", "error")
+                        logger.error(f"Material return failed: {e}", exc_info=True)
 
 # ==================== Production Completion View ====================
 
@@ -597,6 +664,9 @@ def render_production_completion():
     
     if orders.empty:
         st.info("No orders available for completion")
+        if st.button("← Back to List"):
+            set_view('list')
+            st.rerun()
         return
     
     # Order selection
@@ -628,7 +698,7 @@ def render_production_completion():
                 produced_qty = st.number_input(
                     "Produced Quantity",
                     min_value=0.0,
-                    max_value=float(order['planned_qty']) * 1.1,  # 10% tolerance
+                    max_value=float(order['planned_qty']) * 1.1,
                     value=float(order['planned_qty']),
                     step=1.0
                 )
@@ -664,7 +734,9 @@ def render_production_completion():
             
             if submitted:
                 try:
-                    result = prod_manager.complete_production(
+                    validate_positive_number(produced_qty, "Produced quantity")
+                    
+                    result = complete_production(
                         order['id'],
                         produced_qty,
                         batch_no,
@@ -691,6 +763,7 @@ def render_production_completion():
                     
                 except Exception as e:
                     UIHelpers.show_message(f"Error: {str(e)}", "error")
+                    logger.error(f"Production completion failed: {e}", exc_info=True)
             
             if cancel:
                 st.rerun()
@@ -701,6 +774,9 @@ def render_order_details():
     """Render order details view"""
     if not st.session_state.selected_order:
         st.warning("No order selected")
+        if st.button("← Back to List"):
+            set_view('list')
+            st.rerun()
         return
     
     order_id = st.session_state.selected_order
@@ -708,6 +784,9 @@ def render_order_details():
     
     if not order:
         st.error("Order not found")
+        if st.button("← Back to List"):
+            set_view('list')
+            st.rerun()
         return
     
     st.subheader(f"Order Details: {order['order_no']}")
@@ -749,7 +828,7 @@ def render_order_details():
         st.info("No materials found")
     
     # Actions
-    if st.button("Back to List"):
+    if st.button("← Back to List", use_container_width=True):
         set_view('list')
         st.rerun()
 
@@ -788,7 +867,8 @@ def render_dashboard():
         if completed > 0:
             on_time = len(orders[(orders['status'] == 'COMPLETED') & 
                                 (orders['completion_date'] <= orders['scheduled_date'])])
-            st.metric("On-Time Rate", f"{(on_time/completed*100):.1f}%")
+            on_time_rate = calculate_percentage(on_time, completed)
+            st.metric("On-Time Rate", f"{on_time_rate:.1f}%")
         else:
             st.metric("On-Time Rate", "N/A")
     
@@ -805,7 +885,6 @@ def render_dashboard():
         for status, count in status_counts.items():
             st.metric(status, count)
     
-    # Type breakdown
     with col2:
         type_counts = orders['bom_type'].value_counts()
         st.markdown("**Production by Type**")
@@ -837,33 +916,37 @@ def render_dashboard():
 
 def main():
     """Main application entry point"""
-    # Render header
-    render_header()
-    
-    # Render navigation
-    render_navigation()
-    
-    st.markdown("---")
-    
-    # Route to appropriate view
-    view_map = {
-        'list': render_order_list,
-        'new': render_create_order,
-        'issue': render_material_issue,
-        'return': render_material_return,
-        'complete': render_production_completion,
-        'details': render_order_details,
-        'dashboard': render_dashboard
-    }
-    
-    # Get current view handler
-    view_handler = view_map.get(st.session_state.current_view, render_order_list)
-    
     try:
+        # Render header
+        render_header()
+        
+        # Render navigation
+        render_navigation()
+        
+        st.markdown("---")
+        
+        # Route to appropriate view
+        view_map = {
+            'list': render_order_list,
+            'new': render_create_order,
+            'issue': render_material_issue,
+            'return': render_material_return,
+            'complete': render_production_completion,
+            'details': render_order_details,
+            'dashboard': render_dashboard
+        }
+        
+        # Get current view handler
+        view_handler = view_map.get(st.session_state.current_view, render_order_list)
         view_handler()
+        
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
-        logger.error(f"View rendering error: {e}", exc_info=True)
+        logger.error(f"Application error: {e}", exc_info=True)
+        
+        if st.button("← Back to Order List"):
+            set_view('list')
+            st.rerun()
     
     # Footer
     st.markdown("---")
