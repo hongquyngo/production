@@ -1,7 +1,17 @@
 # utils/bom/dialogs/view.py
 """
-View BOM Details Dialog - FIXED VERSION
-Read-only display of BOM information with action buttons
+View BOM Details Dialog with Alternatives Display - VERSION 2.3
+Read-only display of BOM information with alternatives
+
+Changes in v2.3:
+- Updated product/material display to unified format with legacy_code
+
+Changes in v2.2:
+- Added duplicate materials warning section
+- Shows detailed info about which materials are duplicated
+
+Changes in v2.1:
+- Added Export button in action buttons
 """
 
 import logging
@@ -13,7 +23,11 @@ from utils.bom.state import StateManager
 from utils.bom.common import (
     create_status_indicator,
     format_number,
-    render_bom_summary
+    format_product_display,
+    render_bom_summary,
+    # Duplicate detection
+    detect_duplicate_materials_in_bom,
+    render_duplicate_warning_section
 )
 
 logger = logging.getLogger(__name__)
@@ -21,17 +35,11 @@ logger = logging.getLogger(__name__)
 
 @st.dialog("📋 BOM Details", width="large")
 def show_view_dialog(bom_id: int):
-    """
-    View BOM details dialog
-    
-    Args:
-        bom_id: BOM ID to view
-    """
+    """View BOM details dialog"""
     state = StateManager()
     manager = BOMManager()
     
     try:
-        # Load BOM data
         bom_info = manager.get_bom_info(bom_id)
         bom_details = manager.get_bom_details(bom_id)
         
@@ -41,12 +49,16 @@ def show_view_dialog(bom_id: int):
                 st.rerun()
             return
         
-        # Action buttons at top
         _render_action_buttons(bom_id, bom_info, state)
         
         st.markdown("---")
         
-        # BOM header information
+        # Check for duplicate materials and show warning
+        duplicate_info = detect_duplicate_materials_in_bom(bom_id)
+        if duplicate_info.get('has_duplicates'):
+            render_duplicate_warning_section(duplicate_info)
+            st.markdown("---")
+        
         st.markdown("### 📋 BOM Information")
         render_bom_summary(bom_info)
         
@@ -56,19 +68,16 @@ def show_view_dialog(bom_id: int):
         
         st.markdown("---")
         
-        # Materials section
         st.markdown("### 🧱 Materials")
-        _render_materials_section(bom_details)
+        _render_materials_section(bom_details, manager)
         
         st.markdown("---")
         
-        # Usage statistics
         st.markdown("### 📊 Usage Statistics")
         _render_usage_stats(bom_info)
         
         st.markdown("---")
         
-        # Close button
         if st.button("✔ Close", use_container_width=True, key=f"view_main_close_{bom_id}"):
             state.close_dialog()
             st.rerun()
@@ -82,15 +91,8 @@ def show_view_dialog(bom_id: int):
 
 
 def _render_action_buttons(bom_id: int, bom_info: dict, state: StateManager):
-    """
-    Render action buttons at top of dialog
-    
-    Args:
-        bom_id: BOM ID
-        bom_info: BOM information
-        state: State manager
-    """
-    col1, col2, col3, col4 = st.columns(4)
+    """Render action buttons at top of dialog"""
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
         if st.button("✏️ Edit", use_container_width=True, key=f"view_edit_{bom_id}"):
@@ -99,44 +101,43 @@ def _render_action_buttons(bom_id: int, bom_info: dict, state: StateManager):
             st.rerun()
     
     with col2:
-        if st.button("🔄 Change Status", use_container_width=True, key=f"view_status_{bom_id}"):
+        if st.button("🔄 Clone", use_container_width=True, key=f"view_clone_{bom_id}"):
+            state.close_dialog()
+            state.open_dialog(state.DIALOG_CLONE, bom_id)
+            st.rerun()
+    
+    with col3:
+        if st.button("📥 Export", use_container_width=True, key=f"view_export_{bom_id}"):
+            state.close_dialog()
+            state.open_dialog(state.DIALOG_EXPORT, bom_id)
+            st.rerun()
+    
+    with col4:
+        if st.button("📊 Status", use_container_width=True, key=f"view_status_{bom_id}"):
             state.close_dialog()
             state.open_dialog(state.DIALOG_STATUS, bom_id)
             st.rerun()
     
-    with col3:
+    with col5:
         if st.button("🔍 Where Used", use_container_width=True, key=f"view_whereused_{bom_id}"):
-            # Pre-fill product for where used search
             state.set_where_used_product(bom_info['product_id'])
             state.close_dialog()
             state.open_dialog(state.DIALOG_WHERE_USED)
             st.rerun()
-    
-    with col4:
-        if st.button("🗑️ Delete", use_container_width=True, type="secondary", key=f"view_delete_{bom_id}"):
-            state.close_dialog()
-            state.open_dialog(state.DIALOG_DELETE, bom_id)
-            st.rerun()
 
 
-def _render_materials_section(materials: pd.DataFrame):
-    """
-    Render materials section
-    
-    Args:
-        materials: DataFrame with material details
-    """
+def _render_materials_section(materials: pd.DataFrame, manager: BOMManager):
+    """Render materials section with alternatives"""
     if materials.empty:
         st.info("ℹ️ No materials in this BOM")
         return
     
-    # Display summary
     st.write(f"**Total Materials:** {len(materials)}")
     
-    # Group by material type
+    # Summary by type
     type_counts = materials['material_type'].value_counts()
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         raw_count = type_counts.get('RAW_MATERIAL', 0)
@@ -150,50 +151,149 @@ def _render_materials_section(materials: pd.DataFrame):
         cons_count = type_counts.get('CONSUMABLE', 0)
         st.metric("Consumables", cons_count)
     
+    with col4:
+        total_alts = int(materials['alternatives_count'].sum())
+        st.metric("Total Alternatives", total_alts)
+    
     st.markdown("---")
     
-    # Display materials table
-    display_df = materials[[
-        'material_name', 'material_code', 'material_type',
-        'quantity', 'uom', 'scrap_rate', 'current_stock'
-    ]].copy()
+    # Column headers for materials
+    col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1])
+    with col1:
+        st.markdown("**Material (Code)**")
+    with col2:
+        st.markdown("**Type**")
+    with col3:
+        st.markdown("**Quantity**")
+    with col4:
+        st.markdown("**UOM**")
+    with col5:
+        st.markdown("**Scrap %**")
+    with col6:
+        st.markdown("**Stock**")
     
-    # Format columns
-    display_df['quantity'] = display_df['quantity'].apply(
-        lambda x: format_number(x, 4)
-    )
-    display_df['scrap_rate'] = display_df['scrap_rate'].apply(
-        lambda x: f"{format_number(x, 2)}%"
-    )
-    display_df['current_stock'] = display_df['current_stock'].apply(
-        lambda x: format_number(x, 2)
-    )
+    st.markdown("---")
     
-    # Rename columns for display
-    display_df.columns = [
-        'Material Name', 'Code', 'Type', 
-        'Quantity', 'UOM', 'Scrap %', 'Stock'
-    ]
+    # Display materials with alternatives
+    for idx, material in materials.iterrows():
+        _render_material_with_alternatives(material, manager)
+
+
+def _render_material_with_alternatives(material: pd.Series, manager: BOMManager):
+    """Render single material with its alternatives"""
+    alt_count = int(material.get('alternatives_count', 0))
     
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True
-    )
+    # Primary material
+    with st.container():
+        col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1])
+        
+        with col1:
+            alt_badge = f" 🔀 **{alt_count} alt(s)**" if alt_count > 0 else ""
+            mat_display = format_product_display(
+                code=material.get('material_code', ''),
+                name=material.get('material_name', ''),
+                package_size=material.get('package_size'),
+                brand=material.get('brand'),
+                legacy_code=material.get('legacy_code')
+            )
+            st.markdown(f"**{mat_display}**{alt_badge}")
+        
+        with col2:
+            st.text(material['material_type'])
+        
+        with col3:
+            st.text(f"{format_number(material['quantity'], 4)}")
+        
+        with col4:
+            st.text(material['uom'])
+        
+        with col5:
+            st.text(f"{format_number(material['scrap_rate'], 2)}%")
+        
+        with col6:
+            stock_val = float(material['current_stock'])
+            if stock_val > 0:
+                st.success(f"✅ {format_number(stock_val, 2)}")
+            else:
+                st.error("❌ No stock")
     
-    # Highlight materials with low/no stock
-    low_stock = materials[materials['current_stock'] <= 0]
-    if not low_stock.empty:
-        st.warning(f"⚠️ {len(low_stock)} material(s) have no stock available")
+    # Show alternatives if any
+    if alt_count > 0:
+        with st.expander(f"   ↳ View {alt_count} Alternative(s)", expanded=False):
+            _render_alternatives_list(material['id'], manager)
+    
+    st.markdown("")
+
+
+def _render_alternatives_list(detail_id: int, manager: BOMManager):
+    """Render alternatives list for a material"""
+    try:
+        alternatives = manager.get_material_alternatives(detail_id)
+        
+        if alternatives.empty:
+            st.info("ℹ️ No alternatives")
+            return
+        
+        st.markdown("**Alternatives (by priority):**")
+        
+        # Column headers for alternatives
+        col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1])
+        with col1:
+            st.markdown("_Status: Material (Code)_")
+        with col2:
+            st.markdown("_Type_")
+        with col3:
+            st.markdown("_Quantity_")
+        with col4:
+            st.markdown("_UOM_")
+        with col5:
+            st.markdown("_Scrap %_")
+        with col6:
+            st.markdown("_Priority | Stock_")
+        
+        st.markdown("")
+        
+        for idx, alt in alternatives.iterrows():
+            col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1])
+            
+            with col1:
+                status = "✅ Active" if alt['is_active'] else "⭕ Inactive"
+                alt_display = format_product_display(
+                    code=alt.get('material_code', ''),
+                    name=alt.get('material_name', ''),
+                    package_size=alt.get('package_size'),
+                    brand=alt.get('brand'),
+                    legacy_code=alt.get('legacy_code')
+                )
+                st.text(f"  {status}: {alt_display}")
+            
+            with col2:
+                st.text(alt['material_type'])
+            
+            with col3:
+                st.text(f"{format_number(alt['quantity'], 4)}")
+            
+            with col4:
+                st.text(alt['uom'])
+            
+            with col5:
+                st.text(f"{format_number(alt['scrap_rate'], 2)}%")
+            
+            with col6:
+                priority_color = "🟢" if alt['priority'] == 1 else "🟡" if alt['priority'] == 2 else "⚪"
+                stock_val = float(alt['current_stock'])
+                st.text(f"{priority_color} P{alt['priority']} | {format_number(stock_val, 0)}")
+            
+            if alt.get('notes'):
+                st.caption(f"      Note: {alt['notes']}")
+    
+    except Exception as e:
+        logger.error(f"Error rendering alternatives: {e}")
+        st.error(f"❌ Error loading alternatives: {str(e)}")
 
 
 def _render_usage_stats(bom_info: dict):
-    """
-    Render usage statistics
-    
-    Args:
-        bom_info: BOM information dictionary
-    """
+    """Render usage statistics"""
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -218,11 +318,9 @@ def _render_usage_stats(bom_info: dict):
         material_count = bom_info.get('material_count', 0)
         st.metric("Materials", material_count)
     
-    # Additional info
     if bom_info.get('effective_date'):
         st.info(f"ℹ️ Effective from: {bom_info['effective_date']}")
     
-    # Show restrictions if has active orders
     if bom_info.get('active_orders', 0) > 0:
         st.warning(
             "⚠️ This BOM has active manufacturing orders. "
