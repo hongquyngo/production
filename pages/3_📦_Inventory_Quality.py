@@ -67,6 +67,7 @@ def _init_session_state():
         'iq_show_detail': False,
         'iq_detail_data': None,
         'iq_entity_filter': [],
+        'iq_expiry_filter': 'All',
         # Period summary tab
         'iq_period_preset': 'this_month',
         'iq_period_from': today.replace(day=1),
@@ -253,8 +254,8 @@ def render_summary_cards(df: pd.DataFrame):
 # ==================== Filters ====================
 
 def render_filters():
-    """Render filter controls including owning entity multiselect"""
-    col1, col2, col3, col4 = st.columns([2, 2.5, 2.5, 2])
+    """Render filter controls including owning entity and expiry status"""
+    col1, col2, col3, col4, col5 = st.columns([1.5, 2, 2, 2, 1.5])
     
     with col1:
         category_options = ['All', 'GOOD', 'QUARANTINE', 'DEFECTIVE']
@@ -298,12 +299,30 @@ def render_filters():
         entity_ids = tuple(selected_entity_ids) if selected_entity_ids else None
     
     with col4:
+        expiry_options = ['All', 'Expired', 'Near Expiry', 'OK', 'No Expiry']
+        expiry_display = {
+            'All': '📅 All Expiry Status',
+            'Expired': '🔴 Expired',
+            'Near Expiry': '🟡 Expiring Soon (≤90d)',
+            'OK': '🟢 OK (>90d)',
+            'No Expiry': '⚪ No Expiry Date',
+        }
+        
+        selected_expiry = st.selectbox(
+            "Expiry Status",
+            options=expiry_options,
+            format_func=lambda x: expiry_display.get(x, x),
+            key="iq_expiry_filter"
+        )
+    
+    with col5:
         st.write("")  # Spacer
         st.write("")
         if st.button("🔄 Clear Filters", use_container_width=True):
             st.session_state['iq_category_filter'] = 'All'
             st.session_state['iq_warehouse_select'] = {'id': None, 'name': 'All Warehouses'}
             st.session_state['iq_entity_filter'] = []
+            st.session_state['iq_expiry_filter'] = 'All'
             st.session_state['iq_product_search'] = ''
             st.session_state['iq_selected_idx'] = None
             st.rerun()
@@ -317,7 +336,7 @@ def render_filters():
             key="iq_product_search"
         )
     
-    return selected_category, warehouse_id, product_search, entity_ids
+    return selected_category, warehouse_id, product_search, entity_ids, selected_expiry
 
 
 # ==================== Category Indicator ====================
@@ -373,17 +392,26 @@ def render_data_table(df: pd.DataFrame):
     else:
         display_df['entity_display'] = '-'
     
+    # Format expiry date for display
+    if 'expiry_date' in display_df.columns:
+        display_df['expiry_display'] = pd.to_datetime(
+            display_df['expiry_date'], errors='coerce'
+        ).dt.strftime('%d/%m/%Y').fillna('-')
+    else:
+        display_df['expiry_display'] = '-'
+    
     # Create editable dataframe with selection
     edited_df = st.data_editor(
         display_df[[
             'Select', 'category_display', 'product_name', 'package_size_display', 'pt_code', 'batch_number',
-            'qty_display', 'warehouse_name', 'entity_display', 'source_type', 'days_display', 'value_display'
+            'expiry_display', 'qty_display', 'warehouse_name', 'entity_display', 'source_type', 'days_display', 'value_display'
         ]].rename(columns={
             'category_display': 'Category',
             'product_name': 'Product',
             'package_size_display': 'Pkg Size',
             'pt_code': 'PT Code',
             'batch_number': 'Batch',
+            'expiry_display': 'Expiry',
             'qty_display': 'Quantity',
             'warehouse_name': 'Warehouse',
             'entity_display': 'Entity',
@@ -394,7 +422,7 @@ def render_data_table(df: pd.DataFrame):
         width='stretch',
         hide_index=True,
         height=450,
-        disabled=['Category', 'Product', 'Pkg Size', 'PT Code', 'Batch', 'Quantity', 'Warehouse', 'Entity', 'Source', 'Age', 'Value'],
+        disabled=['Category', 'Product', 'Pkg Size', 'PT Code', 'Batch', 'Expiry', 'Quantity', 'Warehouse', 'Entity', 'Source', 'Age', 'Value'],
         column_config={
             'Select': st.column_config.CheckboxColumn(
                 '✓',
@@ -407,6 +435,7 @@ def render_data_table(df: pd.DataFrame):
             'Pkg Size': st.column_config.TextColumn('Pkg Size', width='small'),
             'PT Code': st.column_config.TextColumn('PT Code', width='medium'),
             'Batch': st.column_config.TextColumn('Batch', width='medium'),
+            'Expiry': st.column_config.TextColumn('Expiry', width='medium'),
             'Quantity': st.column_config.TextColumn('Qty', width='small'),
             'Warehouse': st.column_config.TextColumn('Warehouse', width='medium'),
             'Entity': st.column_config.TextColumn('Entity', width='medium'),
@@ -1392,7 +1421,7 @@ def main():
         
         # ---- Tab 1: Dashboard (existing functionality) ----
         with tab_dashboard:
-            category, warehouse_id, product_search, entity_ids = render_filters()
+            category, warehouse_id, product_search, entity_ids, expiry_filter = render_filters()
             st.markdown("---")
             
             with st.spinner("Loading inventory data..."):
@@ -1402,6 +1431,22 @@ def main():
                     product_search=product_search if product_search else None,
                     entity_ids=entity_ids
                 )
+            
+            # Apply expiry status filter client-side
+            if expiry_filter != 'All' and not df.empty and 'expiry_date' in df.columns:
+                today = get_vietnam_today()
+                expiry_dates = pd.to_datetime(df['expiry_date'], errors='coerce')
+                
+                if expiry_filter == 'Expired':
+                    df = df[expiry_dates.dt.date < today].reset_index(drop=True)
+                elif expiry_filter == 'Near Expiry':
+                    near_cutoff = today + timedelta(days=90)
+                    df = df[(expiry_dates.dt.date >= today) & (expiry_dates.dt.date <= near_cutoff)].reset_index(drop=True)
+                elif expiry_filter == 'OK':
+                    near_cutoff = today + timedelta(days=90)
+                    df = df[expiry_dates.dt.date > near_cutoff].reset_index(drop=True)
+                elif expiry_filter == 'No Expiry':
+                    df = df[expiry_dates.isna()].reset_index(drop=True)
             
             render_summary_cards(df)
             st.markdown("---")
